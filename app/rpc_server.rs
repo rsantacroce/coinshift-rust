@@ -11,11 +11,12 @@ use jsonrpsee::{
 use plain_bitassets::{
     authorization::{self, Dst, Signature},
     net::Peer,
+    parent_chain::{swap::{Swap, SwapState}, config::ParentChainType, SwapId, client::TxId},
     state::{self, AmmPair, AmmPoolState, BitAssetSeqId, DutchAuctionState},
     types::{
         Address, AssetId, Authorization, BitAssetData, BitAssetId, Block,
         BlockHash, DutchAuctionId, DutchAuctionParams, EncryptionPubKey,
-        FilledOutputContent, PointedOutput, Transaction, Txid, VerifyingKey,
+        FilledOutputContent, OutPoint, PointedOutput, Transaction, Txid, VerifyingKey,
         WithdrawalBundle, keys::Ecies,
     },
     wallet::Balance,
@@ -737,6 +738,232 @@ impl RpcServer for RpcServerImpl {
         let txid = tx.txid();
         self.app.sign_and_send(tx).map_err(custom_err)?;
         Ok(txid)
+    }
+
+    async fn create_swap(
+        &self,
+        parent_chain: ParentChainType,
+        l1_recipient_address: String,
+        l1_amount_sats: u64,
+        l2_recipient: Address,
+        l2_amount_sats: u64,
+        required_confirmations: Option<u32>,
+    ) -> RpcResult<String> {
+        // Get current height
+        let current_height = self
+            .app
+            .node
+            .try_get_tip_height()
+            .map_err(custom_err)?
+            .map_or(0, |h| h + 1);
+
+        // Create swap transaction
+        let (tx, swap_id) = self
+            .app
+            .wallet
+            .create_swap_create_tx(
+                parent_chain,
+                l1_recipient_address,
+                Amount::from_sat(l1_amount_sats),
+                l2_recipient,
+                Amount::from_sat(l2_amount_sats),
+                required_confirmations,
+                current_height,
+            )
+            .map_err(custom_err)?;
+
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+
+        // Return swap ID as hex string
+        Ok(hex::encode(swap_id.0))
+    }
+
+    async fn update_swap_l1_txid(
+        &self,
+        swap_id: String,
+        l1_txid: String,
+    ) -> RpcResult<()> {
+        // Parse swap ID
+        let swap_id_bytes = hex::decode(&swap_id)
+            .map_err(|e| custom_err_msg(format!("Invalid swap ID: {}", e)))?;
+        if swap_id_bytes.len() != 32 {
+            return Err(custom_err_msg("Swap ID must be 32 bytes"));
+        }
+        let mut swap_id_array = [0u8; 32];
+        swap_id_array.copy_from_slice(&swap_id_bytes);
+        let swap_id = SwapId(swap_id_array);
+
+        // Parse L1 transaction ID
+        // Try Hash32 first (32 bytes), then Hash (variable length)
+        let l1_txid = if l1_txid.len() == 64 {
+            // Hex encoded 32-byte hash
+            let hash_bytes = hex::decode(&l1_txid)
+                .map_err(|e| custom_err_msg(format!("Invalid L1 txid: {}", e)))?;
+            if hash_bytes.len() != 32 {
+                return Err(custom_err_msg("L1 txid must be 32 bytes when hex encoded"));
+            }
+            let mut hash_array = [0u8; 32];
+            hash_array.copy_from_slice(&hash_bytes);
+            TxId::Hash32(hash_array)
+        } else {
+            // Variable length hash
+            let hash_bytes = hex::decode(&l1_txid)
+                .map_err(|e| custom_err_msg(format!("Invalid L1 txid: {}", e)))?;
+            TxId::Hash(hash_bytes)
+        };
+
+        // Get swap from state
+        let env = self.app.node.env();
+        let rotxn = env.read_txn().map_err(custom_err)?;
+        let state = self.app.node.state();
+        let mut swap = state
+            .get_swap(&rotxn, &swap_id)
+            .map_err(custom_err)?
+            .ok_or_else(|| custom_err_msg("Swap not found"))?;
+
+        // Update L1 transaction ID
+        swap.set_l1_txid(l1_txid)
+            .map_err(|e| custom_err_msg(format!("Failed to update swap: {}", e)))?;
+
+        // Save updated swap
+        let mut rwtxn = env.write_txn().map_err(|e| custom_err_msg(format!("Database error: {}", e)))?;
+        state.save_swap(&mut rwtxn, &swap).map_err(custom_err)?;
+        rwtxn.commit().map_err(|e| custom_err_msg(format!("Database commit error: {}", e)))?;
+
+        // Update swap manager
+        if let Some(swap_manager) = self.app.node.swap_manager() {
+            let mut sm = swap_manager.lock().await;
+            if let Some(swap_mut) = sm.get_swap_mut(&swap_id) {
+                *swap_mut = swap;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn get_swap_status(
+        &self,
+        swap_id: String,
+    ) -> RpcResult<Swap> {
+        // Parse swap ID
+        let swap_id_bytes = hex::decode(&swap_id)
+            .map_err(|e| custom_err_msg(format!("Invalid swap ID: {}", e)))?;
+        if swap_id_bytes.len() != 32 {
+            return Err(custom_err_msg("Swap ID must be 32 bytes"));
+        }
+        let mut swap_id_array = [0u8; 32];
+        swap_id_array.copy_from_slice(&swap_id_bytes);
+        let swap_id = SwapId(swap_id_array);
+
+        // Get swap from state
+        let env = self.app.node.env();
+        let rotxn = env.read_txn().map_err(custom_err)?;
+        let state = self.app.node.state();
+        let swap = state
+            .get_swap(&rotxn, &swap_id)
+            .map_err(custom_err)?
+            .ok_or_else(|| custom_err_msg("Swap not found"))?;
+
+        Ok(swap)
+    }
+
+    async fn claim_swap(
+        &self,
+        swap_id: String,
+    ) -> RpcResult<Txid> {
+        // Parse swap ID
+        let swap_id_bytes = hex::decode(&swap_id)
+            .map_err(|e| custom_err_msg(format!("Invalid swap ID: {}", e)))?;
+        if swap_id_bytes.len() != 32 {
+            return Err(custom_err_msg("Swap ID must be 32 bytes"));
+        }
+        let mut swap_id_array = [0u8; 32];
+        swap_id_array.copy_from_slice(&swap_id_bytes);
+        let swap_id = SwapId(swap_id_array);
+
+        // Get swap from state to verify it's ready and get recipient
+        let env = self.app.node.env();
+        let rotxn = env.read_txn().map_err(|e| custom_err_msg(format!("Database error: {}", e)))?;
+        let state = self.app.node.state();
+        let swap = state
+            .get_swap(&rotxn, &swap_id)
+            .map_err(custom_err)?
+            .ok_or_else(|| custom_err_msg("Swap not found"))?;
+
+        // Verify swap is ready to claim
+        if !matches!(swap.state, SwapState::ReadyToClaim) {
+            return Err(custom_err_msg(format!(
+                "Swap not ready to claim. Current state: {:?}",
+                swap.state
+            )));
+        }
+
+        // Find locked outputs for this swap
+        // We need to get UTXOs from the node, not wallet, since locked outputs
+        // might not be in the wallet yet (they're in the state)
+        let mut locked_outputs = Vec::new();
+        let all_utxos = self.app.node.get_all_utxos().map_err(custom_err)?;
+        
+        for (outpoint, _output) in &all_utxos {
+            if let Some(locked_swap_id) = state.is_output_locked_to_swap(&rotxn, outpoint).map_err(custom_err)? {
+                if locked_swap_id == swap_id {
+                    locked_outputs.push(*outpoint);
+                }
+            }
+        }
+
+        if locked_outputs.is_empty() {
+            return Err(custom_err_msg("No locked outputs found for this swap"));
+        }
+
+        // Create claim transaction
+        // Note: The wallet method will try to get outputs from wallet UTXOs
+        // If they're not there, we need to ensure they're available
+        // For now, we'll create the transaction directly using state UTXOs
+        let mut inputs = Vec::new();
+        let mut total_value = Amount::ZERO;
+        
+        for outpoint in &locked_outputs {
+            if let Some(output) = all_utxos.get(outpoint) {
+                total_value = total_value
+                    .checked_add(output.get_bitcoin_value())
+                    .ok_or(AmountOverflowError)
+                    .map_err(|e| custom_err_msg(format!("Amount overflow: {}", e)))?;
+                inputs.push(*outpoint);
+            }
+        }
+
+        if inputs.is_empty() {
+            return Err(custom_err_msg("No valid locked outputs found"));
+        }
+
+        // Create transaction manually since wallet might not have these UTXOs yet
+        use plain_bitassets::types::{Output, OutputContent, BitcoinOutputContent, Transaction, TxData};
+        let outputs = vec![Output {
+            address: swap.l2_recipient,
+            content: OutputContent::Bitcoin(BitcoinOutputContent(total_value)),
+            memo: Vec::new(),
+        }];
+
+        let mut tx = Transaction::new(inputs, outputs);
+        tx.data = Some(TxData::SwapClaim {
+            swap_id: swap_id.0,
+            proof_data: None,
+        });
+
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+
+        Ok(txid)
+    }
+
+    async fn list_swaps(&self) -> RpcResult<Vec<Swap>> {
+        let env = self.app.node.env();
+        let rotxn = env.read_txn().map_err(|e| custom_err_msg(format!("Database error: {}", e)))?;
+        let state = self.app.node.state();
+        let swaps = state.load_all_swaps(&rotxn).map_err(custom_err)?;
+        Ok(swaps)
     }
 }
 

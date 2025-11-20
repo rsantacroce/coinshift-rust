@@ -255,6 +255,8 @@ pub enum Error {
     },
     #[error("invalid header: {0}")]
     InvalidHeader(InvalidHeader),
+    #[error("invalid transaction: {0}")]
+    InvalidTransaction(String),
     #[error(
         "The last output in a BitAsset registration tx must be a control coin"
     )]

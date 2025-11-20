@@ -9,6 +9,7 @@ use l2l_openapi::open_api;
 use plain_bitassets::{
     authorization::{Dst, Signature},
     net::{Peer, PeerConnectionStatus},
+    parent_chain::{swap::Swap, config::ParentChainType, SwapId},
     state::{AmmPoolState, BitAssetSeqId, DutchAuctionState},
     types::{
         Address, AssetId, Authorization, BitAssetData, BitAssetDataUpdates,
@@ -419,4 +420,42 @@ pub trait Rpc {
         fee_sats: u64,
         mainchain_fee_sats: u64,
     ) -> RpcResult<Txid>;
+
+    /// Create a new L2 → L1 swap (offer L2 coins for L1 assets)
+    #[method(name = "create_swap")]
+    async fn create_swap(
+        &self,
+        parent_chain: ParentChainType,
+        l1_recipient_address: String,
+        l1_amount_sats: u64,
+        l2_recipient: Address,
+        l2_amount_sats: u64,
+        required_confirmations: Option<u32>,
+    ) -> RpcResult<String>; // Returns swap_id as hex string
+
+    /// Update swap with L1 transaction ID (when L1 payment is sent)
+    #[method(name = "update_swap_l1_txid")]
+    async fn update_swap_l1_txid(
+        &self,
+        swap_id: String, // hex encoded
+        l1_txid: String, // hex encoded transaction ID
+    ) -> RpcResult<()>;
+
+    /// Get swap status
+    #[method(name = "get_swap_status")]
+    async fn get_swap_status(
+        &self,
+        swap_id: String, // hex encoded
+    ) -> RpcResult<Swap>;
+
+    /// Claim a swap (create SwapClaim transaction)
+    #[method(name = "claim_swap")]
+    async fn claim_swap(
+        &self,
+        swap_id: String, // hex encoded
+    ) -> RpcResult<Txid>;
+
+    /// List all swaps
+    #[method(name = "list_swaps")]
+    async fn list_swaps(&self) -> RpcResult<Vec<Swap>>;
 }

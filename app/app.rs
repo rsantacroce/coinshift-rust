@@ -246,6 +246,23 @@ impl App {
             .map(|wallet| Miner::new(cusf_mainchain.clone(), wallet))
             .transpose()?;
         let local_pool = LocalPoolHandle::new(1);
+        
+        // Create parent chain client if configured
+        let parent_chain_client = if !config.parent_chain_config.chains.is_empty() {
+            match plain_bitassets::parent_chain::ParentChainClient::new(&config.parent_chain_config) {
+                Ok(client) => {
+                    tracing::info!("Parent chain client initialized with {} chain(s)", config.parent_chain_config.chains.len());
+                    Some(client)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize parent chain client: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        
         tracing::debug!("Initializing node...");
         let node = runtime.block_on(Node::new(
             config.net_addr,
@@ -254,6 +271,7 @@ impl App {
             cusf_mainchain,
             cusf_mainchain_wallet,
             &runtime,
+            parent_chain_client,
             #[cfg(feature = "zmq")]
             config.zmq_addr,
         ))?;

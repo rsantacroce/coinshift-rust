@@ -258,6 +258,40 @@ pub enum Command {
         #[arg(long)]
         mainchain_fee_sats: u64,
     },
+    /// Create a new L2 → L1 swap (offer L2 coins for L1 assets)
+    CreateSwap {
+        #[arg(long)]
+        parent_chain: plain_bitassets::parent_chain::config::ParentChainType,
+        #[arg(long)]
+        l1_recipient_address: String,
+        #[arg(long)]
+        l1_amount_sats: u64,
+        #[arg(long)]
+        l2_recipient: Address,
+        #[arg(long)]
+        l2_amount_sats: u64,
+        #[arg(long)]
+        required_confirmations: Option<u32>,
+    },
+    /// Update swap with L1 transaction ID (when L1 payment is sent)
+    UpdateSwap {
+        #[arg(long)]
+        swap_id: String,
+        #[arg(long)]
+        l1_txid: String,
+    },
+    /// Get swap status
+    SwapStatus {
+        #[arg(long)]
+        swap_id: String,
+    },
+    /// Claim a swap (create SwapClaim transaction)
+    ClaimSwap {
+        #[arg(long)]
+        swap_id: String,
+    },
+    /// List all swaps
+    ListSwaps,
 }
 
 const DEFAULT_RPC_HOST: Host = Host::Ipv4(Ipv4Addr::LOCALHOST);
@@ -600,6 +634,42 @@ where
                 )
                 .await?;
             format!("{txid}")
+        }
+        Command::CreateSwap {
+            parent_chain,
+            l1_recipient_address,
+            l1_amount_sats,
+            l2_recipient,
+            l2_amount_sats,
+            required_confirmations,
+        } => {
+            let swap_id = rpc_client
+                .create_swap(
+                    parent_chain,
+                    l1_recipient_address,
+                    l1_amount_sats,
+                    l2_recipient,
+                    l2_amount_sats,
+                    required_confirmations,
+                )
+                .await?;
+            format!("Swap created! Swap ID: {}\nYour coins are locked. Share this swap ID with the filler.", swap_id)
+        }
+        Command::UpdateSwap { swap_id, l1_txid } => {
+            rpc_client.update_swap_l1_txid(swap_id, l1_txid).await?;
+            "Swap updated! Waiting for confirmations...".to_string()
+        }
+        Command::SwapStatus { swap_id } => {
+            let swap = rpc_client.get_swap_status(swap_id).await?;
+            serde_json::to_string_pretty(&swap)?
+        }
+        Command::ClaimSwap { swap_id } => {
+            let txid = rpc_client.claim_swap(swap_id).await?;
+            format!("Swap claimed! Transaction ID: {}\nYour L2 coins will be available after the next block.", txid)
+        }
+        Command::ListSwaps => {
+            let swaps = rpc_client.list_swaps().await?;
+            serde_json::to_string_pretty(&swaps)?
         }
     })
 }

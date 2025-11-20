@@ -384,6 +384,39 @@ pub enum TransactionData {
         /// Amount of the received quote asset
         amount_received: u64,
     },
+    /// Create a new swap (L2 → L1 for exchanges, L1 → L2 is handled by BIP300)
+    SwapCreate {
+        /// Swap ID (computed from swap parameters)
+        #[serde(with = "serde_hexstr_human_readable")]
+        #[schema(value_type = String)]
+        swap_id: [u8; 32],
+        /// Parent chain type (BTC, BCH, LTC, XMR, ETH, Tron)
+        parent_chain: crate::parent_chain::ParentChainType,
+        /// L1 transaction ID that must be confirmed (for L2→L1, placeholder until filled)
+        /// Serialized as hex for Hash32, bytes for Hash
+        l1_txid_bytes: Vec<u8>,
+        /// Required number of confirmations
+        required_confirmations: u32,
+        /// L2 address that will receive the coins (Bob's address for L2→L1)
+        l2_recipient: Address,
+        /// Amount of L2 coins to be paid
+        l2_amount: u64,
+        /// For L2→L1 swaps: L1 address where L1 coins should be sent (Alice's BTC address)
+        l1_recipient_address: Option<String>,
+        /// For L2→L1 swaps: Amount of L1 coins required
+        l1_amount: Option<u64>,
+    },
+    /// Claim L2 coins from a swap after L1 transaction is confirmed
+    SwapClaim {
+        /// Swap ID to claim
+        #[serde(with = "serde_hexstr_human_readable")]
+        #[schema(value_type = String)]
+        swap_id: [u8; 32],
+        /// Optional proof data for future verification enhancements
+        #[serde(with = "serde_hexstr_human_readable")]
+        #[schema(value_type = Option<String>)]
+        proof_data: Option<Hash>,
+    },
 }
 
 pub type TxData = TransactionData;

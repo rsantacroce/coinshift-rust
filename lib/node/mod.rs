@@ -19,6 +19,7 @@ use crate::{
     archive::{self, Archive},
     mempool::{self, MemPool},
     net::{self, Net, Peer},
+    parent_chain::{swap::SwapManager, ParentChainClient},
     state::{
         self, AmmPair, AmmPoolState, BitAssetSeqId, DutchAuctionState, State,
     },
@@ -125,6 +126,8 @@ pub struct Node<MainchainTransport = Channel> {
     mempool: MemPool,
     net: Net,
     net_task: NetTaskHandle,
+    parent_chain_client: Option<Arc<ParentChainClient>>,
+    swap_manager: Arc<Mutex<SwapManager>>,
     state: State,
     #[cfg(feature = "zmq")]
     zmq_pub_handler: Arc<ZmqPubHandler>,
@@ -144,6 +147,7 @@ where
             mainchain::WalletClient<MainchainTransport>,
         >,
         runtime: &tokio::runtime::Runtime,
+        parent_chain_client: Option<ParentChainClient>,
         #[cfg(feature = "zmq")] zmq_addr: SocketAddr,
     ) -> Result<Self, Error>
     where
@@ -191,6 +195,21 @@ where
             unsafe { Env::open(&env_open_opts, &env_path) }?
         };
         let state = State::new(&env)?;
+        
+        // Initialize swap manager and load swaps from database
+        let mut swap_manager = SwapManager::new();
+        {
+            let rotxn = env.read_txn()?;
+            let swaps = state.load_all_swaps(&rotxn)?;
+            for swap in swaps {
+                swap_manager.swaps.insert(swap.id.clone(), swap);
+            }
+        }
+        let swap_manager = Arc::new(Mutex::new(swap_manager));
+        
+        // Wrap parent chain client in Arc if provided
+        let parent_chain_client = parent_chain_client.map(Arc::new);
+        
         #[cfg(feature = "zmq")]
         let zmq_pub_handler = Arc::new(ZmqPubHandler::new(zmq_addr).await?);
         let archive = Archive::new(&env)?;
@@ -218,6 +237,43 @@ where
             #[cfg(feature = "zmq")]
             zmq_pub_handler.clone(),
         );
+        // Spawn background task to update swap states periodically
+        if let Some(ref parent_chain_client) = parent_chain_client {
+            let swap_manager_clone = swap_manager.clone();
+            let state_clone = state.clone();
+            let env_clone = env.clone();
+            runtime.spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    if let Ok(mut sm) = swap_manager_clone.lock() {
+                        if let Ok(rotxn) = env_clone.read_txn() {
+                            if let Ok(current_height) = state_clone.try_get_height(&rotxn) {
+                                if let Some(height) = current_height {
+                                    if let Err(e) = sm.update_all_swaps(
+                                        parent_chain_client.as_ref(),
+                                        height,
+                                    ) {
+                                        tracing::warn!("Error updating swaps: {}", e);
+                                    } else {
+                                        // Save updated swaps to database
+                                        if let Ok(mut rwtxn) = env_clone.write_txn() {
+                                            for swap in sm.swaps.values() {
+                                                if let Err(e) = state_clone.save_swap(&mut rwtxn, swap) {
+                                                    tracing::warn!("Error saving swap: {}", e);
+                                                }
+                                            }
+                                            let _ = rwtxn.commit();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        
         Ok(Self {
             archive,
             cusf_mainchain: Arc::new(Mutex::new(cusf_mainchain)),
@@ -227,6 +283,8 @@ where
             mempool,
             net,
             net_task,
+            parent_chain_client,
+            swap_manager,
             state,
             #[cfg(feature = "zmq")]
             zmq_pub_handler: zmq_pub_handler.clone(),
@@ -955,5 +1013,20 @@ where
     /// Get a notification whenever the tip changes
     pub fn watch_state(&self) -> impl Stream<Item = ()> {
         self.state.watch()
+    }
+
+    /// Get reference to state
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+
+    /// Get reference to environment
+    pub fn env(&self) -> &sneed::Env {
+        &self.env
+    }
+
+    /// Get reference to swap manager
+    pub fn swap_manager(&self) -> Option<&Arc<Mutex<SwapManager>>> {
+        Some(&self.swap_manager)
     }
 }

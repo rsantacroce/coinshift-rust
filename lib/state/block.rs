@@ -4,6 +4,7 @@ use rayon::prelude::*;
 use sneed::{RoTxn, RwTxn};
 
 use crate::{
+    parent_chain::{swap::Swap, SwapId, client::TxId, config::ParentChainType},
     state::{Error, PrevalidatedBlock, State, amm, dutch_auction, error},
     types::{
         AmountOverflowError, Authorization, BitAssetId, BlockHash, Body,
@@ -352,6 +353,103 @@ pub fn connect_prevalidated(
                     prevalidated.next_height,
                 )?;
             }
+            Some(TxData::SwapCreate {
+                swap_id,
+                parent_chain,
+                l1_txid_bytes,
+                required_confirmations,
+                l2_recipient,
+                l2_amount,
+                l1_recipient_address,
+                ..
+            }) => {
+                // Reconstruct TxId from bytes
+                let l1_txid = if l1_txid_bytes.len() == 32 {
+                    let mut hash32 = [0u8; 32];
+                    hash32.copy_from_slice(&l1_txid_bytes);
+                    TxId::Hash32(hash32)
+                } else {
+                    TxId::Hash(l1_txid_bytes.clone())
+                };
+                
+                // Create swap
+                let swap = Swap::new(
+                    parent_chain.clone(),
+                    l1_txid,
+                    Some(*required_confirmations),
+                    *l2_recipient,
+                    bitcoin::Amount::from_sat(*l2_amount),
+                    prevalidated.next_height,
+                );
+                
+                // Verify swap ID matches
+                if swap.id.0 != *swap_id {
+                    return Err(Error::InvalidTransaction(format!(
+                        "Swap ID mismatch: expected {:?}, got {:?}",
+                        swap.id.0, swap_id
+                    )));
+                }
+                
+                // COIN LOCKING FOR L2 → L1 SWAPS
+                // If l1_recipient_address is set, this is an L2 → L1 swap
+                // Lock all outputs of this transaction to the swap
+                if l1_recipient_address.is_some() {
+                    let swap_id = SwapId(*swap_id);
+                    let Some(filled_outputs) = filled_tx.filled_outputs() else {
+                        return Err(Error::InvalidTransaction(
+                            "SwapCreate transaction must have outputs".to_string()
+                        ));
+                    };
+                    
+                    // Lock all outputs to this swap
+                    for (vout, _filled_output) in filled_outputs.iter().enumerate() {
+                        let outpoint = OutPoint::Regular {
+                            txid: filled_tx.txid(),
+                            vout: vout as u32,
+                        };
+                        state.lock_output_to_swap(rwtxn, &outpoint, &swap_id)?;
+                    }
+                }
+                
+                // Save swap to database
+                state.save_swap(rwtxn, &swap)?;
+            }
+            Some(TxData::SwapClaim { swap_id, .. }) => {
+                let swap_id = SwapId(*swap_id);
+                
+                // Get swap from database
+                let swap = state.get_swap(rwtxn, &swap_id)?
+                    .ok_or_else(|| Error::InvalidTransaction(
+                        format!("Swap not found: {:?}", swap_id)
+                    ))?;
+                
+                // Verify swap is ready to claim
+                if !matches!(swap.state, crate::parent_chain::swap::SwapState::ReadyToClaim) {
+                    return Err(Error::InvalidTransaction(format!(
+                        "Swap not ready to claim: {:?}",
+                        swap.state
+                    )));
+                }
+                
+                // COIN UNLOCKING FOR SWAP CLAIMS
+                // Unlock all inputs that are locked to this swap
+                for input in &filled_tx.transaction.inputs {
+                    if let Some(locked_swap_id) = state.is_output_locked_to_swap(rwtxn, input)? {
+                        if locked_swap_id == swap_id {
+                            // Unlock this output
+                            state.unlock_output_from_swap(rwtxn, input)?;
+                        }
+                    }
+                }
+                
+                // Mark swap as completed
+                let mut swap = swap;
+                swap.mark_completed()
+                    .map_err(|e| Error::InvalidTransaction(format!("Failed to mark swap completed: {}", e)))?;
+                
+                // Update swap in database
+                state.save_swap(rwtxn, &swap)?;
+            }
         }
     }
 
@@ -478,6 +576,14 @@ pub fn connect(
                 let () = state
                     .bitassets
                     .put_reservation(rwtxn, &txid, commitment)?;
+            }
+            Some(TxData::SwapCreate { .. }) => {
+                // TODO: Handle SwapCreate in connect() function
+                // See: lib/state/block.rs:356-392 for implementation in connect_prevalidated
+            }
+            Some(TxData::SwapClaim { .. }) => {
+                // TODO: Handle SwapClaim in connect() function
+                // See: lib/state/block.rs:394-420 for implementation in connect_prevalidated
             }
             Some(TxData::BitAssetRegistration {
                 name_hash,
@@ -637,6 +743,53 @@ pub fn disconnect_tip(
                     rwtxn,
                     &filled_tx,
                 )?;
+            }
+            Some(TxData::SwapCreate { swap_id, l1_recipient_address, .. }) => {
+                // Delete swap created in this block
+                let swap_id = SwapId(*swap_id);
+                
+                // ROLLBACK: Unlock outputs if this was an L2 → L1 swap
+                if l1_recipient_address.is_some() {
+                    if let Some(filled_outputs) = filled_tx.filled_outputs() {
+                        // Unlock all outputs that were locked to this swap
+                        for (vout, _filled_output) in filled_outputs.iter().enumerate() {
+                            let outpoint = OutPoint::Regular {
+                                txid: filled_tx.txid(),
+                                vout: vout as u32,
+                            };
+                            // Only unlock if it's actually locked to this swap
+                            if let Some(locked_swap_id) = state.is_output_locked_to_swap(rwtxn, &outpoint)? {
+                                if locked_swap_id == swap_id {
+                                    state.unlock_output_from_swap(rwtxn, &outpoint)?;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                state.delete_swap(rwtxn, &swap_id)?;
+            }
+            Some(TxData::SwapClaim { swap_id, .. }) => {
+                // Revert swap claim - set state back to ReadyToClaim
+                let swap_id = SwapId(*swap_id);
+                
+                // ROLLBACK: Re-lock outputs that were unlocked by this claim
+                for input in &filled_tx.transaction.inputs {
+                    // Check if this input is currently unlocked (it was unlocked by the claim)
+                    // We need to re-lock it to the swap
+                    if state.is_output_locked_to_swap(rwtxn, input)?.is_none() {
+                        // This output was unlocked by the claim, re-lock it
+                        state.lock_output_to_swap(rwtxn, input, &swap_id)?;
+                    }
+                }
+                
+                if let Some(mut swap) = state.get_swap(rwtxn, &swap_id)? {
+                    // Only revert if swap was completed (not if it was already in another state)
+                    if matches!(swap.state, crate::parent_chain::swap::SwapState::Completed) {
+                        swap.state = crate::parent_chain::swap::SwapState::ReadyToClaim;
+                        state.save_swap(rwtxn, &swap)?;
+                    }
+                }
             }
         }
         // delete UTXOs, last-to-first

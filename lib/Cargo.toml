@@ -41,6 +41,7 @@ num = "0.4.1"
 parking_lot = { workspace = true }
 prost = { workspace = true }
 prost-types = "0.13.3"
+reqwest = { version = "0.12.15", features = ["json", "rustls-tls"] }
 quinn = "0.11.6"
 rayon = "1.7.0"
 rcgen = "0.13.2"
@@ -85,3 +86,6 @@ workspace = true
 [lib]
 name = "plain_bitassets"
 path = "lib.rs"
+
+[dev-dependencies]
+tempfile = "3.8.0"
